@@ -1,0 +1,1385 @@
+// ─── FIREBASE CONFIG ──────────────────────────────────────────────────────────
+// 🔥 SETUP (free, 5 minutes):
+// 1. console.firebase.google.com → New Project → name it "realitylive"
+// 2. Click Web (</>), register app, copy config values into FIREBASE_CONFIG below
+// 3. Build → Authentication → Sign-in method → enable Email/Password
+// 4. Build → Firestore Database → Create database → Start in test mode
+// 5. Paste your real values below — accounts + votes save permanently instantly
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyDvOfC3ggo204_urbjarcKDnHIMKNqPJxU",
+  authDomain:        "realitylive-c9e27.firebaseapp.com",
+  projectId:         "realitylive-c9e27",
+  storageBucket:     "realitylive-c9e27.firebasestorage.app",
+  messagingSenderId: "476273854407",
+  appId:             "1:476273854407:web:49dd27e1d288009497bbe2",
+  measurementId:     "G-FNRT2QF0J5",
+};
+const FB_READY = FIREBASE_CONFIG.apiKey !== "YOUR_FIREBASE_API_KEY";
+
+// ── Dynamic Firebase loader (no npm needed in prototype) ──────────────────────
+let _db = null, _auth = null, _fbLoaded = false;
+async function loadFirebase() {
+  if (_fbLoaded) return { db: _db, auth: _auth };
+  if (!FB_READY)  return { db: null, auth: null };
+  try {
+    const [appMod, fsMod, authMod] = await Promise.all([
+      import("https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js"),
+      import("https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js"),
+      import("https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js"),
+    ]);
+    const app = appMod.initializeApp(FIREBASE_CONFIG);
+    _db   = { fs: fsMod.getFirestore(app), doc: fsMod.doc, setDoc: fsMod.setDoc, getDoc: fsMod.getDoc, updateDoc: fsMod.updateDoc, increment: fsMod.increment };
+    _auth = { a: authMod.getAuth(app), createUser: authMod.createUserWithEmailAndPassword, signIn: authMod.signInWithEmailAndPassword, signOut: authMod.signOut, GoogleProvider: authMod.GoogleAuthProvider, signInWithPopup: authMod.signInWithPopup };
+    _fbLoaded = true;
+    return { db: _db, auth: _auth };
+  } catch(e) { console.error("Firebase:", e); return { db: null, auth: null }; }
+}
+
+// ── Auth helpers ───────────────────────────────────────────────────────────────
+async function fbSignUp(email, password, name, role) {
+  const { auth, db } = await loadFirebase();
+  if (!auth) return null;
+  try {
+    const cred = await auth.createUser(auth.a, email, password);
+    const uid  = cred.user.uid;
+    const profile = { name, email, role, voteCredits: 3, createdAt: Date.now() };
+    if (db) await db.setDoc(db.doc(db.fs, "users", uid), profile);
+    return { uid, ...profile };
+  } catch(e) { return { error: e.message }; }
+}
+async function fbSignIn(email, password) {
+  const { auth, db } = await loadFirebase();
+  if (!auth) return null;
+  try {
+    const cred = await auth.signIn(auth.a, email, password);
+    const uid  = cred.user.uid;
+    if (db) {
+      const snap = await db.getDoc(db.doc(db.fs, "users", uid));
+      if (snap.exists()) return { uid, ...snap.data() };
+    }
+    return { uid, name: email.split("@")[0], email, role: "viewer", voteCredits: 3 };
+  } catch(e) { return { error: e.message }; }
+}
+async function fbAddVotes(uid, credits) {
+  const { db } = await loadFirebase();
+  if (!db || !uid) return;
+  await db.updateDoc(db.doc(db.fs, "users", uid), { voteCredits: db.increment(credits) });
+}
+async function fbCastVote(uid, showId, contestantIdx) {
+  const { db } = await loadFirebase();
+  if (!db || !uid) return;
+  await db.setDoc(db.doc(db.fs, "votes", `${uid}_${showId}`), { uid, showId, contestantIdx, ts: Date.now() });
+  await db.updateDoc(db.doc(db.fs, "users", uid), { voteCredits: db.increment(-1) });
+}
+
+async function fbGoogleSignIn() {
+  const { auth, db } = await loadFirebase();
+  if (!auth) return { error: "Firebase not configured" };
+  try {
+    const provider = new auth.GoogleProvider();
+    const cred = await auth.signInWithPopup(auth.a, provider);
+    const uid  = cred.user.uid;
+    const name = cred.user.displayName || cred.user.email.split("@")[0];
+    const email = cred.user.email;
+    if (db) {
+      const snap = await db.getDoc(db.doc(db.fs, "users", uid));
+      if (snap.exists()) return { uid, ...snap.data() };
+      const profile = { name, email, role: "viewer", voteCredits: 3, createdAt: Date.now() };
+      await db.setDoc(db.doc(db.fs, "users", uid), profile);
+      return { uid, ...profile };
+    }
+    return { uid, name, email, role: "viewer", voteCredits: 3 };
+  } catch(e) { return { error: e.message }; }
+}
+
+async function fbSaveReport(uid, showId, reason) {
+  const { db } = await loadFirebase();
+  if (!db) return;
+  await db.setDoc(db.doc(db.fs, "reports", `${uid}_${showId}_${Date.now()}`), {
+    uid, showId, reason, ts: Date.now(), reviewed: false
+  });
+}
+
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
+// Bold broadcast aesthetic: deep navy-black base, electric amber accent
+// (TV broadcast warmth, not gaming-green). Signature: animated "ON AIR" ticker.
+const T = {
+  bg:       "#080810",
+  surface:  "#0F0F1A",
+  card:     "#161625",
+  border:   "#252538",
+  accent:   "#E8365D",        // red — bold, broadcast energy
+  accentLo: "rgba(232,54,93,0.12)",
+  red:      "#C0183D",
+  redLo:    "rgba(192,24,61,0.12)",
+  green:    "#1DB954",
+  text:     "#EEEEFc",
+  muted:    "#6B6B8A",
+  white:    "#FFFFFF",
+};
+
+// ─── AGORA CONFIG ─────────────────────────────────────────────────────────────
+// 🔴 REAL AGORA SETUP:
+// 1. Go to console.agora.io → create a project → copy App ID below
+// 2. For testing with no token auth: set Token Security to "No certificate"
+// 3. Install: npm install agora-rtc-sdk-ng
+// 4. Replace APP_ID with your real Agora App ID
+const AGORA_APP_ID = "eb6533f773124b6ab8e7b782bc718c84";
+
+// ─── PAYSTACK CONFIG ──────────────────────────────────────────────────────────
+// 🟢 YOUR PAYSTACK KEYS:
+// Paste your PUBLIC key below (starts with pk_live_ or pk_test_)
+// NEVER paste your secret key in frontend code
+const PAYSTACK_PUBLIC_KEY = "pk_live_2cdbfd0a3340c67656ca92204f4c78901fed0a19";
+
+// Vote packages (in Naira — change currency/amounts as needed)
+const VOTE_PACKS = [
+  { id: "starter", label: "Starter Pack", votes: 10,  amount: 50000,  display: "₦500" },
+  { id: "super",   label: "Super Fan",    votes: 50,  amount: 200000, display: "₦2,000" },
+  { id: "legend",  label: "Legend Pack",  votes: 150, amount: 500000, display: "₦5,000" },
+];
+
+// ─── MOCK DATA ────────────────────────────────────────────────────────────────
+const SHOWS = [
+  { id: "s1", title: "Vocal Powerhouse",    emoji: "🎤", host: "Amara K.", viewers: 3842, color: T.accent,  contestants: ["Chisom", "Bayo", "Zainab", "Emeka"],  votes: [820, 610, 940, 430] },
+  { id: "s2", title: "Street Comedy Battle",emoji: "😂", host: "Tunde F.", viewers: 1920, color: T.red,    contestants: ["Sola",   "Kemi", "Dami",  "Rauf"],    votes: [510, 390, 280, 620] },
+  { id: "s3", title: "Dance Explosion",     emoji: "💃", host: "Blessing O.",viewers:2611,color:"#9B5DE5", contestants: ["Fatima", "Chidi","Ngozi", "Seun"],   votes: [730, 540, 410, 680] },
+  { id: "s4", title: "Hustle Nation",       emoji: "🏙️", host: "Chuks M.", viewers: 987,  color:"#06D6A0", contestants: ["Ada",    "Jide", "Hauwa","Tope"],    votes: [310, 280, 190, 350] },
+];
+
+const LEADERBOARD = [
+  { rank:1, name:"Zainab",  show:"Vocal Powerhouse",    votes:14820, color:T.accent },
+  { rank:2, name:"Rauf",    show:"Street Comedy",       votes:11240, color:T.red    },
+  { rank:3, name:"Chisom",  show:"Vocal Powerhouse",    votes:9310,  color:T.accent },
+  { rank:4, name:"Seun",    show:"Dance Explosion",     votes:7650,  color:"#9B5DE5"},
+  { rank:5, name:"Tope",    show:"Hustle Nation",       votes:6200,  color:"#06D6A0"},
+];
+
+const SEED_CHAT = [
+  { user:"superfan_ng",  text:"Zainab is GOING OFF right now 🔥", ts:"just now" },
+  { user:"realtvaddict", text:"Vote Rauf!! he carried that last set",ts:"1m" },
+  { user:"watchdog99",   text:"This is better than Big Brother lol", ts:"2m" },
+  { user:"stageking",    text:"First time here — this is REAL",      ts:"3m" },
+];
+
+// ─── GLOBAL CSS ───────────────────────────────────────────────────────────────
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Syne:wght@700;800&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin:0; padding:0; }
+  html { scroll-behavior: smooth; }
+  body { background:${T.bg}; color:${T.text}; font-family:'Space Grotesk',sans-serif; min-height:100vh; }
+
+  ::-webkit-scrollbar { width:3px; }
+  ::-webkit-scrollbar-track { background:${T.surface}; }
+  ::-webkit-scrollbar-thumb { background:${T.border}; border-radius:2px; }
+
+  .syne { font-family:'Syne',sans-serif; }
+
+  /* Broadcast ticker */
+  @keyframes ticker {
+    0%   { transform:translateX(100vw); }
+    100% { transform:translateX(-100%); }
+  }
+  .ticker-inner { display:inline-block; animation:ticker 28s linear infinite; white-space:nowrap; }
+
+  /* Live pulse */
+  @keyframes livepulse {
+    0%,100% { box-shadow:0 0 0 0 rgba(232,54,93,0.7); }
+    70%     { box-shadow:0 0 0 8px rgba(232,54,93,0); }
+  }
+  .live-dot {
+    width:8px; height:8px; border-radius:50%;
+    background:${T.red}; display:inline-block;
+    animation:livepulse 1.6s ease-in-out infinite;
+  }
+
+  /* Buttons */
+  .btn-primary {
+    background:${T.accent}; color:#000; border:none; border-radius:8px;
+    font-family:'Space Grotesk',sans-serif; font-weight:700; cursor:pointer;
+    transition:all 0.15s; letter-spacing:0.02em;
+  }
+  .btn-primary:hover { filter:brightness(1.12); transform:translateY(-1px); }
+  .btn-primary:active { transform:translateY(0); }
+
+  .btn-danger {
+    background:${T.red}; color:#fff; border:none; border-radius:8px;
+    font-family:'Space Grotesk',sans-serif; font-weight:700; cursor:pointer;
+    transition:all 0.15s;
+  }
+  .btn-danger:hover { filter:brightness(1.1); }
+
+  .btn-ghost {
+    background:transparent; color:${T.muted}; border:1px solid ${T.border};
+    border-radius:8px; font-family:'Space Grotesk',sans-serif; font-weight:500;
+    cursor:pointer; transition:all 0.15s;
+  }
+  .btn-ghost:hover { color:${T.text}; border-color:${T.muted}; }
+
+  /* Cards */
+  .card { background:${T.card}; border:1px solid ${T.border}; border-radius:14px; }
+  .card-hover { transition:border-color 0.2s, transform 0.2s; }
+  .card-hover:hover { border-color:#3A3A58; transform:translateY(-2px); }
+
+  /* Input */
+  input, textarea, select {
+    background:${T.surface}; border:1px solid ${T.border}; border-radius:8px;
+    color:${T.text}; font-family:'Space Grotesk',sans-serif; font-size:14px;
+    padding:10px 14px; outline:none; transition:border-color 0.15s; width:100%;
+  }
+  input:focus, textarea:focus, select:focus { border-color:${T.accent}; }
+  input::placeholder, textarea::placeholder { color:${T.muted}; }
+
+  /* Modal */
+  .modal-bg {
+    position:fixed; inset:0; background:rgba(0,0,0,0.8);
+    backdrop-filter:blur(6px); z-index:100;
+    display:flex; align-items:center; justify-content:center;
+    animation:fadeIn 0.2s ease; padding:16px;
+  }
+  @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+
+  /* Chat bubble */
+  .bubble {
+    background:${T.surface}; border-radius:10px;
+    padding:8px 12px; font-size:13px; line-height:1.5;
+    animation:slideUp 0.25s ease;
+  }
+  @keyframes slideUp {
+    from{opacity:0;transform:translateY(6px)}
+    to{opacity:1;transform:translateY(0)}
+  }
+
+  /* Vote bar */
+  .vbar-bg { background:${T.border}; border-radius:99px; height:5px; overflow:hidden; }
+  .vbar-fill { height:100%; border-radius:99px; transition:width 0.7s cubic-bezier(.4,0,.2,1); }
+
+  /* Toast */
+  .toast {
+    position:fixed; bottom:24px; right:24px; z-index:300;
+    background:${T.card}; border:1px solid ${T.border};
+    border-left:3px solid ${T.accent}; border-radius:10px;
+    padding:14px 18px; font-size:14px; max-width:300px;
+    animation:slideUp 0.3s ease;
+  }
+
+  /* Nav tab */
+  .ntab {
+    background:transparent; border:none; cursor:pointer;
+    font-family:'Space Grotesk',sans-serif; font-size:14px; font-weight:600;
+    color:${T.muted}; padding:9px 15px; border-radius:8px; transition:all 0.15s;
+  }
+  .ntab:hover { color:${T.text}; background:${T.card}; }
+  .ntab.on { color:${T.text}; background:${T.card}; border-bottom:2px solid ${T.accent}; }
+
+  /* Stream placeholder */
+  .stream-bg {
+    background:linear-gradient(135deg,#08081A,#14102A);
+    border-radius:12px; position:relative; overflow:hidden;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:10px;
+  }
+  .stream-bg::before {
+    content:''; position:absolute; inset:0;
+    background:repeating-linear-gradient(0deg,transparent,transparent 38px,
+      rgba(255,255,255,0.015) 38px,rgba(255,255,255,0.015) 39px);
+  }
+
+  /* Agora video container */
+  #agora-local  { width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; }
+  #agora-remote { width:100%; height:100%; border-radius:12px; overflow:hidden; background:#111; }
+
+  .avatar {
+    border-radius:50%; display:flex; align-items:center;
+    justify-content:center; font-weight:700; color:#fff; flex-shrink:0;
+  }
+
+  @media(max-width:680px) {
+    .hide-sm { display:none !important; }
+    .col-sm  { flex-direction:column !important; }
+  }
+`;
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+const fmt = n => n >= 1000 ? (n/1000).toFixed(1)+"K" : n;
+
+function Toast({ msg, onDone }) {
+  useEffect(() => { const t = setTimeout(onDone, 3000); return () => clearTimeout(t); }, []);
+  return <div className="toast">✅ {msg}</div>;
+}
+
+// ─── PAYSTACK HOOK ────────────────────────────────────────────────────────────
+// Loads Paystack inline script and triggers payment popup
+function usePaystack() {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    if (window.PaystackPop) { setReady(true); return; }
+    const s = document.createElement("script");
+    s.src = "https://js.paystack.co/v1/inline.js";
+    s.onload = () => setReady(true);
+    document.head.appendChild(s);
+  }, []);
+
+  const pay = useCallback(({ email, amount, onSuccess, onClose, meta = {} }) => {
+    if (!window.PaystackPop) { alert("Paystack not loaded yet, try again."); return; }
+    const handler = window.PaystackPop.setup({
+      key: PAYSTACK_PUBLIC_KEY,
+      email,
+      amount,               // in kobo (₦1 = 100 kobo)
+      currency: "NGN",
+      ref: "RL_" + Date.now() + "_" + Math.random().toString(36).slice(2,8),
+      metadata: { custom_fields: [{ display_name: "Platform", value: "RealityLive", ...meta }] },
+      callback: res => onSuccess(res),
+      onClose,
+    });
+    handler.openIframe();
+  }, []);
+
+  return { ready, pay };
+}
+
+// ─── AGORA HOOK ───────────────────────────────────────────────────────────────
+// Loads Agora Web SDK dynamically and manages channel join/leave
+// In production: generate tokens server-side and pass here
+function useAgora() {
+  const clientRef = useRef(null);
+  const [status, setStatus] = useState("idle"); // idle | joining | live | watching | error
+  const [localTracks, setLocalTracks] = useState({ audio: null, video: null });
+  const [remoteUsers, setRemoteUsers] = useState([]);
+
+  // Dynamically load Agora SDK
+  useEffect(() => {
+    if (window.AgoraRTC) return;
+    const s = document.createElement("script");
+    s.src = "https://download.agora.io/sdk/release/AgoraRTC_N.js";
+    s.async = true;
+    document.head.appendChild(s);
+  }, []);
+
+  async function startBroadcast(channelName) {
+    if (!window.AgoraRTC) { setStatus("error"); return; }
+    try {
+      setStatus("joining");
+      const client = window.AgoraRTC.createClient({ mode:"live", codec:"vp8" });
+      await client.setClientRole("host");
+      // 🔴 For production: replace null with a token from your backend
+      await client.join(AGORA_APP_ID, channelName, null, null);
+      const [audioTrack, videoTrack] = await window.AgoraRTC.createMicrophoneAndCameraTracks();
+      await client.publish([audioTrack, videoTrack]);
+      videoTrack.play("agora-local");
+      clientRef.current = client;
+      setLocalTracks({ audio: audioTrack, video: videoTrack });
+      setStatus("live");
+    } catch(e) {
+      console.error("Agora broadcast error:", e);
+      setStatus("error");
+    }
+  }
+
+  async function watchStream(channelName) {
+    if (!window.AgoraRTC) { setStatus("error"); return; }
+    try {
+      setStatus("joining");
+      const client = window.AgoraRTC.createClient({ mode:"live", codec:"vp8" });
+      await client.setClientRole("audience");
+      await client.join(AGORA_APP_ID, channelName, null, null);
+      client.on("user-published", async (user, mediaType) => {
+        await client.subscribe(user, mediaType);
+        if (mediaType === "video") user.videoTrack.play("agora-remote");
+        if (mediaType === "audio") user.audioTrack.play();
+        setRemoteUsers(prev => [...prev.filter(u => u.uid !== user.uid), user]);
+      });
+      client.on("user-unpublished", user => {
+        setRemoteUsers(prev => prev.filter(u => u.uid !== user.uid));
+      });
+      clientRef.current = client;
+      setStatus("watching");
+    } catch(e) {
+      console.error("Agora watch error:", e);
+      setStatus("error");
+    }
+  }
+
+  async function stopAll() {
+    const { audio, video } = localTracks;
+    audio?.close(); video?.close();
+    await clientRef.current?.leave();
+    clientRef.current = null;
+    setLocalTracks({ audio:null, video:null });
+    setRemoteUsers([]);
+    setStatus("idle");
+  }
+
+  return { status, remoteUsers, startBroadcast, watchStream, stopAll };
+}
+
+// ─── AUTH MODAL ───────────────────────────────────────────────────────────────
+function AuthModal({ onAuth }) {
+  const [mode, setMode]       = useState("login");
+  const [form, setForm]       = useState({ name:"", email:"", password:"", role:"viewer" });
+  const [loading, setLoading] = useState(false);
+  const [error, setError]     = useState("");
+  const [ageConfirmed, setAgeConfirmed] = useState(false);
+  const set = k => e => setForm(p => ({ ...p, [k]: e.target.value }));
+
+  async function submit() {
+    if (!form.email || !form.password) { setError("Email and password required."); return; }
+    if (mode === "signup" && !ageConfirmed) { setError("You must confirm you are 18 or older to join."); return; }
+    setLoading(true); setError("");
+    if (FB_READY) {
+      const result = mode === "signup"
+        ? await fbSignUp(form.email, form.password, form.name || form.email.split("@")[0], form.role)
+        : await fbSignIn(form.email, form.password);
+      if (result?.error) { setError(result.error.replace("Firebase:","").replace("Error (auth/","").replace(")","").trim()); setLoading(false); return; }
+      if (result) { onAuth(result); return; }
+      setError("Something went wrong. Try again.");
+      setLoading(false);
+    } else {
+      onAuth({ name: form.name || form.email.split("@")[0], email: form.email, role: form.role, voteCredits: 3 });
+    }
+  }
+
+  async function googleLogin() {
+    setLoading(true); setError("");
+    if (!ageConfirmed && mode === "signup") { setError("Please confirm your age first."); setLoading(false); return; }
+    const result = await fbGoogleSignIn();
+    if (result?.error) { setError("Google sign-in failed. Try email instead."); setLoading(false); return; }
+    if (result) { onAuth(result); return; }
+    setLoading(false);
+  }
+
+  return (
+    <div className="modal-bg">
+      <div className="card" style={{ width:370, padding:32 }}>
+        <div className="syne" style={{ fontSize:30, color:T.white, marginBottom:2 }}>
+          REALITY<span style={{ color:T.accent }}>LIVE</span>
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:16 }}>
+          <div style={{ width:8, height:8, borderRadius:"50%", background: FB_READY ? T.green : T.muted }} />
+          <span style={{ fontSize:11, color: FB_READY ? T.green : T.muted, fontWeight:600 }}>
+            {FB_READY ? "Live platform — accounts save permanently" : "Demo mode"}
+          </span>
+        </div>
+
+        {/* Mode tabs */}
+        <div style={{ display:"flex", gap:8, marginBottom:20 }}>
+          {[["login","Sign In"],["signup","Sign Up"]].map(([m,l]) => (
+            <button key={m} onClick={() => { setMode(m); setError(""); }} style={{
+              flex:1, padding:"9px", borderRadius:8,
+              border:`1px solid ${mode===m ? T.accent : T.border}`,
+              background: mode===m ? T.accentLo : "transparent",
+              color: mode===m ? T.white : T.muted,
+              cursor:"pointer", fontFamily:"Space Grotesk", fontWeight:600, fontSize:13
+            }}>{l}</button>
+          ))}
+        </div>
+
+        <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+          {/* Google Sign-In button */}
+          <button onClick={googleLogin} disabled={loading} style={{
+            width:"100%", padding:"11px", borderRadius:8, border:`1px solid ${T.border}`,
+            background:T.surface, color:T.text, cursor:"pointer",
+            fontFamily:"Space Grotesk", fontWeight:600, fontSize:14,
+            display:"flex", alignItems:"center", justifyContent:"center", gap:10,
+            transition:"all 0.15s", opacity: loading ? 0.7 : 1
+          }}>
+            <svg width="18" height="18" viewBox="0 0 24 24">
+              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+            </svg>
+            Continue with Google
+          </button>
+
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <div style={{ flex:1, height:1, background:T.border }} />
+            <span style={{ fontSize:12, color:T.muted }}>or</span>
+            <div style={{ flex:1, height:1, background:T.border }} />
+          </div>
+
+          {mode==="signup" && <input placeholder="Your name" value={form.name} onChange={set("name")} />}
+          <input placeholder="Email address" type="email" value={form.email} onChange={set("email")} />
+          <input placeholder="Password (min 6 characters)" type="password" value={form.password} onChange={set("password")} />
+
+          {mode==="signup" && (
+            <select value={form.role} onChange={set("role")}>
+              <option value="viewer">👀 Viewer — watch & vote</option>
+              <option value="creator">🎬 Creator — host shows</option>
+            </select>
+          )}
+
+          {/* Age confirmation — required for signup */}
+          {mode==="signup" && (
+            <label style={{ display:"flex", alignItems:"flex-start", gap:10, cursor:"pointer", padding:"10px 12px", background:T.surface, borderRadius:8, border:`1px solid ${ageConfirmed ? T.accent : T.border}` }}>
+              <input type="checkbox" checked={ageConfirmed} onChange={e => setAgeConfirmed(e.target.checked)}
+                style={{ width:16, height:16, marginTop:2, accentColor:T.accent, flexShrink:0 }} />
+              <span style={{ fontSize:12, color:T.muted, lineHeight:1.5 }}>
+                I confirm I am <strong style={{ color:T.text }}>18 years or older</strong> and I agree to the{" "}
+                <span style={{ color:T.accent, cursor:"pointer" }}>Terms of Service</span> and{" "}
+                <span style={{ color:T.accent, cursor:"pointer" }}>Privacy Policy</span>
+              </span>
+            </label>
+          )}
+
+          {error && (
+            <div style={{ fontSize:12, color:"#ff6b6b", background:"rgba(255,107,107,0.1)", borderRadius:8, padding:"8px 12px", border:"1px solid rgba(255,107,107,0.2)" }}>
+              ⚠️ {error}
+            </div>
+          )}
+
+          <button className="btn-primary" onClick={submit} disabled={loading}
+            style={{ padding:"13px", fontSize:15, borderRadius:8, marginTop:4, opacity: loading?0.7:1 }}>
+            {loading ? "Please wait..." : mode==="login" ? "Sign In →" : "Create Account →"}
+          </button>
+        </div>
+
+        <p style={{ color:T.muted, fontSize:11, textAlign:"center", marginTop:16 }}>
+          Free to join · Talent from anywhere · Voted by everyone
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ─── PAYSTACK VOTE MODAL ─────────────────────────────────────────────────────
+function BuyVotesModal({ user, onClose, onSuccess }) {
+  const { ready, pay } = usePaystack();
+  const [selected, setSelected] = useState(VOTE_PACKS[0]);
+
+  function handlePay() {
+    pay({
+      email: user.email,
+      amount: selected.amount,
+      meta: { display_name:"Vote Pack", value: selected.label },
+      onSuccess: res => {
+        onSuccess(selected.votes, selected.label);
+        onClose();
+      },
+      onClose,
+    });
+  }
+
+  return (
+    <div className="modal-bg">
+      <div className="card" style={{ width:380, padding:28 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+          <div className="syne" style={{ fontSize:22, color:T.white }}>
+            BUY <span style={{ color:T.accent }}>VOTES</span>
+          </div>
+          <button className="btn-ghost" onClick={onClose} style={{ padding:"5px 11px", fontSize:13 }}>✕</button>
+        </div>
+
+        <p style={{ color:T.muted, fontSize:13, marginBottom:20 }}>
+          Votes decide who wins. Get your pack and back your favourite.
+        </p>
+
+        <div style={{ display:"flex", flexDirection:"column", gap:10, marginBottom:20 }}>
+          {VOTE_PACKS.map(pack => (
+            <div key={pack.id} onClick={() => setSelected(pack)}
+              className="card" style={{
+                padding:"14px 16px", cursor:"pointer",
+                borderColor: selected.id===pack.id ? T.accent : T.border,
+                background: selected.id===pack.id ? T.accentLo : T.card,
+                display:"flex", justifyContent:"space-between", alignItems:"center"
+              }}>
+              <div>
+                <div style={{ fontWeight:700, color:T.white }}>{pack.label}</div>
+                <div style={{ fontSize:12, color:T.muted, marginTop:2 }}>{pack.votes} votes</div>
+              </div>
+              <div style={{ fontWeight:700, color:T.accent, fontSize:18 }}>{pack.display}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ background:T.surface, borderRadius:10, padding:12, marginBottom:16, fontSize:13, color:T.muted }}>
+          💳 Powered by <strong style={{ color:T.text }}>Paystack</strong> — card, bank transfer, USSD supported
+        </div>
+
+        <button className="btn-primary" onClick={handlePay} disabled={!ready}
+          style={{ width:"100%", padding:"13px", fontSize:15, borderRadius:8 }}>
+          {ready ? `Pay ${selected.display} → Get ${selected.votes} Votes` : "Loading payment..."}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── GO LIVE MODAL (with real Agora) ─────────────────────────────────────────
+function GoLiveModal({ user, onClose, onToast }) {
+  const [title, setTitle] = useState("");
+  const [step, setStep] = useState(1);
+  const { status, startBroadcast, stopAll } = useAgora();
+  const channelRef = useRef("");
+
+  async function goLive() {
+    if (!title.trim()) return;
+    const channel = "rl_" + title.replace(/\s+/g,"_").toLowerCase().slice(0,20) + "_" + Date.now();
+    channelRef.current = channel;
+    setStep(2);
+    await startBroadcast(channel);
+    onToast("You're LIVE! Viewers can now join your show.");
+  }
+
+  async function endStream() {
+    await stopAll();
+    onClose();
+  }
+
+  // Show real Agora config warning if key not set
+  const agoraReady = AGORA_APP_ID !== "YOUR_AGORA_APP_ID";
+
+  if (step === 2) return (
+    <div className="modal-bg">
+      <div className="card" style={{ width:"min(480px,95vw)", overflow:"hidden" }}>
+        <div style={{ height:240, position:"relative" }}>
+          {agoraReady && status === "live"
+            ? <div id="agora-local" style={{ width:"100%", height:"100%" }} />
+            : (
+              <div className="stream-bg" style={{ height:240 }}>
+                <div style={{ fontSize:48 }}>🎥</div>
+                <div style={{ color:T.accent, fontWeight:700 }}>
+                  {agoraReady ? (status === "joining" ? "Connecting camera..." : "Camera error") : "DEMO MODE — Add Agora App ID to go live"}
+                </div>
+                <p style={{ color:T.muted, fontSize:12, textAlign:"center", maxWidth:280 }}>
+                  {agoraReady ? "Check camera permissions" : "See setup instructions in the code comments"}
+                </p>
+              </div>
+            )
+          }
+          <div style={{ position:"absolute", top:12, left:12, display:"flex", alignItems:"center", gap:6,
+            background:"rgba(0,0,0,0.7)", padding:"5px 10px", borderRadius:99 }}>
+            <span className="live-dot" />
+            <span style={{ fontSize:12, fontWeight:700, color:"#fff" }}>
+              {status === "live" ? "LIVE" : status.toUpperCase()}
+            </span>
+          </div>
+        </div>
+        <div style={{ padding:20 }}>
+          <div className="syne" style={{ fontSize:20, color:T.white, marginBottom:4 }}>{title}</div>
+          <p style={{ color:T.muted, fontSize:13, marginBottom:16 }}>Hosted by {user.name}</p>
+          <div style={{ display:"flex", gap:10 }}>
+            <button className="btn-danger" onClick={endStream} style={{ flex:1, padding:11, fontSize:14, borderRadius:8 }}>
+              ⏹ End Stream
+            </button>
+            <button className="btn-ghost" onClick={() => navigator.clipboard?.writeText(channelRef.current).then(() => onToast("Channel ID copied!"))}
+              style={{ flex:1, padding:11, fontSize:13, borderRadius:8 }}>
+              📋 Share Link
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="modal-bg">
+      <div className="card" style={{ width:420, padding:28 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+          <div className="syne" style={{ fontSize:24, color:T.white }}>
+            GO <span style={{ color:T.red }}>LIVE</span>
+          </div>
+          <button className="btn-ghost" onClick={onClose} style={{ padding:"5px 11px", fontSize:13 }}>✕</button>
+        </div>
+
+        {!agoraReady && (
+          <div style={{ background:"#1A1000", border:`1px solid ${T.accent}44`, borderRadius:10, padding:14, marginBottom:16, fontSize:13 }}>
+            <strong style={{ color:T.accent }}>⚠️ Agora not configured yet.</strong>
+            <p style={{ color:T.muted, marginTop:4 }}>
+              Get a free App ID at <strong style={{ color:T.text }}>console.agora.io</strong> → paste into AGORA_APP_ID at top of file.
+              Live video will work immediately after.
+            </p>
+          </div>
+        )}
+
+        <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+          <div>
+            <label style={{ fontSize:12, color:T.muted, fontWeight:600, display:"block", marginBottom:6, letterSpacing:"0.07em" }}>
+              YOUR SHOW TITLE
+            </label>
+            <input placeholder="e.g. Vocal Powerhouse Episode 4" value={title} onChange={e => setTitle(e.target.value)} />
+          </div>
+
+          <div style={{ background:T.surface, borderRadius:10, padding:14 }}>
+            <div style={{ fontSize:12, color:T.muted, marginBottom:8, fontWeight:600 }}>📷 CAMERA PREVIEW</div>
+            <div style={{ height:100, background:"#0a0a14", borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", gap:6 }}>
+              <div style={{ fontSize:24 }}>🎥</div>
+              <p style={{ fontSize:12, color:T.muted }}>
+                {agoraReady ? "Camera activates when you go live" : "Add Agora App ID to enable camera"}
+              </p>
+            </div>
+          </div>
+
+          <button className="btn-primary" onClick={goLive} style={{ padding:14, fontSize:15, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+            <span className="live-dot" style={{ width:7, height:7 }} />
+            Start Broadcasting
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SHOW DETAIL MODAL ────────────────────────────────────────────────────────
+function ShowDetail({ show, user, onClose, onToast, onBuyVotes }) {
+  const [votes, setVotes] = useState([...show.votes]);
+  const [voted, setVoted] = useState(null);
+  const [chat, setChat] = useState([...SEED_CHAT]);
+  const [msg, setMsg] = useState("");
+  const { status, watchStream, stopAll } = useAgora();
+  const [watching, setWatching] = useState(false);
+  const [showReport, setShowReport] = useState(false);
+  const [reportReason, setReportReason] = useState("");
+  const [reported, setReported] = useState(false);
+
+  async function submitReport() {
+    if (!reportReason) return;
+    await fbSaveReport(user.uid || "anon", show.id, reportReason).catch(console.error);
+    setReported(true);
+    setShowReport(false);
+    onToast("Report submitted. We review all reports within 24 hours.");
+  }
+
+  const total = votes.reduce((a,b) => a+b, 0);
+  const agoraReady = AGORA_APP_ID !== "YOUR_AGORA_APP_ID";
+  const channel = "rl_" + show.title.replace(/\s+/g,"_").toLowerCase();
+
+  async function toggleWatch() {
+    if (watching) { await stopAll(); setWatching(false); }
+    else { await watchStream(channel); setWatching(true); }
+  }
+
+  function vote(i) {
+    if (voted !== null) return;
+    if (user.voteCredits < 1) { onBuyVotes(); return; }
+    const nv = [...votes]; nv[i] += 1;
+    setVotes(nv); setVoted(i);
+    user.voteCredits -= 1;
+    onToast(`Voted for ${show.contestants[i]}! (${user.voteCredits} votes left)`);
+    // Save vote to Firestore if Firebase is configured
+    if (user.uid) fbCastVote(user.uid, show.id, i).catch(console.error);
+  }
+
+  function sendChat() {
+    if (!msg.trim()) return;
+    setChat(p => [{ user:user.name, text:msg.trim(), ts:"just now" }, ...p]);
+    setMsg("");
+  }
+
+  return (
+    <div className="modal-bg">
+      <div className="card" style={{ width:"min(740px,96vw)", maxHeight:"92vh", overflow:"hidden", display:"flex", flexDirection:"column" }}>
+        {/* Header */}
+        <div style={{ padding:"15px 20px", borderBottom:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center", flexShrink:0 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <span style={{ fontSize:22 }}>{show.emoji}</span>
+            <div>
+              <div className="syne" style={{ fontSize:18, color:T.white }}>{show.title}</div>
+              <div style={{ fontSize:12, color:T.muted }}>by {show.host} · 👁 {fmt(show.viewers)} watching</div>
+            </div>
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            {!reported && (
+              <button onClick={() => setShowReport(p => !p)} style={{
+                padding:"5px 11px", fontSize:12, borderRadius:7,
+                background:"rgba(232,54,93,0.1)", border:"1px solid rgba(232,54,93,0.3)",
+                color:T.accent, cursor:"pointer", fontFamily:"Space Grotesk", fontWeight:600
+              }}>⚑ Report</button>
+            )}
+            <button className="btn-ghost" onClick={onClose} style={{ padding:"5px 11px", fontSize:13 }}>✕</button>
+          </div>
+        </div>
+
+        {/* Report panel */}
+        {showReport && (
+          <div style={{ padding:"14px 20px", background:"rgba(232,54,93,0.06)", borderBottom:`1px solid ${T.border}`, flexShrink:0 }}>
+            <div style={{ fontSize:13, fontWeight:600, color:T.text, marginBottom:10 }}>Why are you reporting this stream?</div>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:10 }}>
+              {["Nudity / sexual content","Violence or harm","Hate speech","Spam or scam","Underage content","Other"].map(r => (
+                <button key={r} onClick={() => setReportReason(r)} style={{
+                  padding:"6px 12px", borderRadius:20, fontSize:12, fontWeight:600,
+                  border:`1px solid ${reportReason===r ? T.accent : T.border}`,
+                  background: reportReason===r ? T.accentLo : "transparent",
+                  color: reportReason===r ? T.accent : T.muted,
+                  cursor:"pointer", fontFamily:"Space Grotesk"
+                }}>{r}</button>
+              ))}
+            </div>
+            <div style={{ display:"flex", gap:8 }}>
+              <button onClick={submitReport} disabled={!reportReason} style={{
+                padding:"8px 16px", borderRadius:7, fontSize:13, fontWeight:700,
+                background:T.accent, color:"#fff", border:"none",
+                cursor: reportReason ? "pointer" : "not-allowed", opacity: reportReason ? 1 : 0.5,
+                fontFamily:"Space Grotesk"
+              }}>Submit Report</button>
+              <button onClick={() => setShowReport(false)} className="btn-ghost" style={{ padding:"8px 14px", fontSize:13 }}>Cancel</button>
+            </div>
+          </div>
+        )}
+
+        <div style={{ display:"flex", overflow:"hidden", flex:1 }}>
+          {/* Left: stream + voting */}
+          <div style={{ flex:1, overflowY:"auto", padding:18, display:"flex", flexDirection:"column", gap:16 }}>
+            {/* Stream area */}
+            <div style={{ height:180, position:"relative" }}>
+              {agoraReady && watching && status==="watching"
+                ? <div id="agora-remote" style={{ width:"100%", height:"100%" }} />
+                : (
+                  <div className="stream-bg" style={{ height:180 }}>
+                    <div style={{ fontSize:36 }}>{show.emoji}</div>
+                    <div style={{ color:show.color, fontWeight:700, fontSize:14 }}>
+                      {agoraReady ? (watching ? "Connecting..." : "Click Watch to join live") : "DEMO — Add Agora App ID to watch live"}
+                    </div>
+                    <div style={{ display:"flex", gap:6, alignItems:"center", background:"rgba(0,0,0,0.6)", padding:"4px 10px", borderRadius:99, zIndex:1 }}>
+                      <span className="live-dot" />
+                      <span style={{ fontSize:12, color:"#fff" }}>{fmt(show.viewers)} watching</span>
+                    </div>
+                  </div>
+                )
+              }
+              <button onClick={toggleWatch} style={{
+                position:"absolute", bottom:10, right:10,
+                background:"rgba(0,0,0,0.75)", border:`1px solid ${T.border}`,
+                borderRadius:7, color:T.text, fontFamily:"Space Grotesk",
+                fontSize:12, fontWeight:600, padding:"6px 12px", cursor:"pointer"
+              }}>
+                {watching ? "⏹ Stop" : "▶ Watch Live"}
+              </button>
+            </div>
+
+            {/* Voting */}
+            <div>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+                <div style={{ fontSize:12, color:T.muted, fontWeight:600, letterSpacing:"0.07em" }}>
+                  🗳️ VOTE · {fmt(total)} total
+                </div>
+                <button onClick={onBuyVotes} style={{
+                  fontSize:11, color:T.accent, fontWeight:700,
+                  background:T.accentLo, border:`1px solid ${T.accent}44`,
+                  borderRadius:6, padding:"4px 10px", cursor:"pointer", fontFamily:"Space Grotesk"
+                }}>
+                  + Buy Votes ({user.voteCredits || 0} left)
+                </button>
+              </div>
+
+              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+                {show.contestants.map((name,i) => {
+                  const pct = Math.round((votes[i]/total)*100);
+                  const leading = votes[i] === Math.max(...votes);
+                  return (
+                    <div key={i} style={{ display:"flex", alignItems:"center", gap:10 }}>
+                      <div className="avatar" style={{ width:32, height:32, background:show.color+"33", color:show.color, fontSize:12 }}>
+                        {name[0]}
+                      </div>
+                      <div style={{ flex:1 }}>
+                        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
+                          <span style={{ fontSize:13, fontWeight:600, color: leading ? T.white : T.text }}>
+                            {name} {leading && "👑"}
+                          </span>
+                          <span style={{ fontSize:13, color:show.color, fontWeight:700 }}>{pct}%</span>
+                        </div>
+                        <div className="vbar-bg">
+                          <div className="vbar-fill" style={{ width:`${pct}%`, background:show.color }} />
+                        </div>
+                      </div>
+                      <button onClick={() => vote(i)} disabled={voted!==null}
+                        style={{ padding:"6px 11px", borderRadius:6,
+                          border:`1px solid ${voted===i ? show.color : T.border}`,
+                          background: voted===i ? show.color+"33" : "transparent",
+                          color: voted===i ? show.color : T.muted,
+                          cursor: voted===null ? "pointer" : "default",
+                          fontSize:12, fontWeight:700, fontFamily:"Space Grotesk", minWidth:52, transition:"all 0.15s"
+                        }}>
+                        {voted===i ? "✓" : "Vote"}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {voted===null && (
+                <p style={{ fontSize:12, color:T.muted, marginTop:10, textAlign:"center" }}>
+                  No votes yet? <button onClick={onBuyVotes} style={{ color:T.accent, background:"none", border:"none", cursor:"pointer", fontSize:12, fontWeight:700 }}>Buy a vote pack to join →</button>
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Right: chat */}
+          <div className="hide-sm" style={{ width:215, borderLeft:`1px solid ${T.border}`, display:"flex", flexDirection:"column" }}>
+            <div style={{ padding:"11px 14px", fontSize:11, color:T.muted, fontWeight:700, borderBottom:`1px solid ${T.border}`, letterSpacing:"0.08em" }}>
+              💬 LIVE CHAT
+            </div>
+            <div style={{ flex:1, overflowY:"auto", padding:10, display:"flex", flexDirection:"column", gap:7 }}>
+              {chat.map((c,i) => (
+                <div key={i} className="bubble">
+                  <span style={{ color:show.color, fontWeight:700, fontSize:12 }}>{c.user} </span>
+                  <span style={{ color:T.text }}>{c.text}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{ padding:8, borderTop:`1px solid ${T.border}`, display:"flex", gap:6 }}>
+              <input value={msg} onChange={e => setMsg(e.target.value)}
+                onKeyDown={e => e.key==="Enter" && sendChat()}
+                placeholder="Chat..." style={{ fontSize:12, padding:"7px 10px" }} />
+              <button className="btn-primary" onClick={sendChat} style={{ padding:"7px 10px", fontSize:13, borderRadius:6 }}>↑</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SHOW CARD ────────────────────────────────────────────────────────────────
+function ShowCard({ show, onClick }) {
+  const total = show.votes.reduce((a,b)=>a+b,0);
+  const maxIdx = show.votes.indexOf(Math.max(...show.votes));
+  return (
+    <div className="card card-hover" onClick={onClick} style={{ cursor:"pointer", overflow:"hidden" }}>
+      <div style={{ height:105, background:`linear-gradient(135deg,${show.color}20,${show.color}06)`,
+        display:"flex", alignItems:"center", justifyContent:"center", fontSize:44, position:"relative" }}>
+        {show.emoji}
+        <div style={{ position:"absolute", top:10, left:10, display:"flex", alignItems:"center", gap:5,
+          background:"rgba(0,0,0,0.65)", padding:"3px 9px", borderRadius:99 }}>
+          <span className="live-dot" />
+          <span style={{ fontSize:11, color:"#fff", fontWeight:700 }}>LIVE</span>
+        </div>
+        <div style={{ position:"absolute", top:10, right:10, fontSize:12, color:T.muted }}>
+          👁 {fmt(show.viewers)}
+        </div>
+      </div>
+      <div style={{ padding:"13px 15px" }}>
+        <div className="syne" style={{ fontSize:16, color:T.white, lineHeight:1.2, marginBottom:3 }}>{show.title}</div>
+        <p style={{ fontSize:12, color:T.muted, marginBottom:10 }}>by {show.host}</p>
+        <div style={{ display:"flex", justifyContent:"space-between" }}>
+          <span style={{ fontSize:11, color:T.muted }}>{show.contestants.length} competing</span>
+          <span style={{ fontSize:11, color:show.color, fontWeight:600 }}>
+            👑 {show.contestants[maxIdx]} leads
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SETUP GUIDE ─────────────────────────────────────────────────────────────
+function SetupGuide() {
+  const steps = [
+    {
+      step:"01", color: T.accent, title:"Connect Agora (Live Video)",
+      items:[
+        "Go to console.agora.io → sign up free",
+        "Create a project → copy your App ID",
+        'Open this file → find AGORA_APP_ID at the top',
+        "Replace \"YOUR_AGORA_APP_ID\" with your real key",
+        "Done. Live video works immediately.",
+      ]
+    },
+    {
+      step:"02", color: T.green, title:"Connect Paystack (Payments)",
+      items:[
+        "Log into your Paystack dashboard",
+        "Go to Settings → API Keys → copy your PUBLIC key",
+        'Find PAYSTACK_PUBLIC_KEY at top of this file',
+        "Replace with your real pk_live_ or pk_test_ key",
+        "Payments are now live. ₦ flows to your account.",
+      ]
+    },
+    {
+      step:"03", color:"#9B5DE5", title:"Deploy to the Internet (Free)",
+      items:[
+        "Push this file to a GitHub repository",
+        "Go to vercel.com → Import your GitHub repo",
+        "Click Deploy — takes 60 seconds",
+        "You get a live URL like realitylive.vercel.app",
+        "Share it. Real users can sign up and watch.",
+      ]
+    },
+    {
+      step:"04", color: T.red, title:"Get Your First 100 Users",
+      items:[
+        "DM 10 talented friends: 'Be on my live show tonight'",
+        "Post the link on Twitter, TikTok, WhatsApp groups",
+        "Host your first show yourself — be the first creator",
+        "Screenshot voting results → post as content",
+        "Repeat weekly. Community grows itself.",
+      ]
+    },
+  ];
+
+  return (
+    <div>
+      <div className="syne" style={{ fontSize:26, color:T.white, marginBottom:4 }}>
+        LAUNCH <span style={{ color:T.accent }}>GUIDE</span>
+      </div>
+      <p style={{ color:T.muted, fontSize:14, marginBottom:24 }}>
+        4 steps to go from this prototype to a real, live product.
+      </p>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))", gap:16 }}>
+        {steps.map(s => (
+          <div key={s.step} className="card" style={{ padding:20, borderColor:s.color+"44" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:14 }}>
+              <div style={{ width:36, height:36, borderRadius:10, background:s.color+"22",
+                color:s.color, fontFamily:"Syne", fontWeight:800, fontSize:13,
+                display:"flex", alignItems:"center", justifyContent:"center" }}>
+                {s.step}
+              </div>
+              <div style={{ fontWeight:700, color:T.white, fontSize:15 }}>{s.title}</div>
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+              {s.items.map((item,i) => (
+                <div key={i} style={{ display:"flex", gap:9, alignItems:"flex-start" }}>
+                  <span style={{ color:s.color, fontWeight:700, fontSize:12, marginTop:1, flexShrink:0 }}>{i+1}.</span>
+                  <span style={{ fontSize:13, color:T.muted, lineHeight:1.5 }}>{item}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Tech stack explainer */}
+      <div className="card" style={{ padding:20, marginTop:20 }}>
+        <div style={{ fontWeight:700, color:T.white, marginBottom:14, fontSize:15 }}>
+          📱 Is this an app or a website?
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))", gap:12 }}>
+          {[
+            { label:"Right now", val:"Website (React)", desc:"Works on phone browser & desktop" },
+            { label:"Phase 2", val:"PWA", desc:"Add to home screen like an app, no App Store needed" },
+            { label:"Phase 3", val:"Native App", desc:"React Native — same code, real iOS & Android app" },
+          ].map(r => (
+            <div key={r.label} style={{ background:T.surface, borderRadius:10, padding:14 }}>
+              <div style={{ fontSize:11, color:T.muted, fontWeight:600, marginBottom:4 }}>{r.label}</div>
+              <div style={{ fontWeight:700, color:T.accent, marginBottom:4 }}>{r.val}</div>
+              <div style={{ fontSize:12, color:T.muted }}>{r.desc}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── LEADERBOARD ─────────────────────────────────────────────────────────────
+function Leaderboard() {
+  return (
+    <div>
+      <div className="syne" style={{ fontSize:26, color:T.white, marginBottom:4 }}>
+        THIS WEEK'S <span style={{ color:"#FFD700" }}>TOP TALENTS</span>
+      </div>
+      <p style={{ color:T.muted, fontSize:13, marginBottom:20 }}>Rankings reset every Sunday. The crowd decides everything.</p>
+      <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+        {LEADERBOARD.map(p => (
+          <div key={p.rank} className="card" style={{ padding:"15px 18px", display:"flex", alignItems:"center", gap:14,
+            borderColor: p.rank===1 ? "#FFD70066" : T.border }}>
+            <div style={{ width:30, fontFamily:"Syne", fontWeight:800, fontSize:22, textAlign:"center",
+              color: p.rank===1?"#FFD700":p.rank===2?"#C0C0C0":p.rank===3?"#CD7F32":T.muted }}>
+              {p.rank}
+            </div>
+            <div className="avatar" style={{ width:40, height:40, background:p.color+"33", color:p.color }}>
+              {p.name[0]}
+            </div>
+            <div style={{ flex:1 }}>
+              <div style={{ fontWeight:700, color:T.white }}>{p.name}</div>
+              <div style={{ fontSize:12, color:T.muted }}>{p.show}</div>
+            </div>
+            <div style={{ textAlign:"right" }}>
+              <div style={{ fontWeight:700, color:p.color, fontSize:17 }}>{fmt(p.votes)}</div>
+              <div style={{ fontSize:11, color:T.muted }}>votes</div>
+            </div>
+            {p.rank===1 && <div style={{ fontSize:20 }}>🏆</div>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── PROFILE ─────────────────────────────────────────────────────────────────
+function Profile({ user, onLogout, onBuyVotes }) {
+  return (
+    <div>
+      <div style={{ display:"flex", alignItems:"center", gap:18, marginBottom:24 }}>
+        <div className="avatar" style={{ width:68, height:68, background:T.accent+"33", color:T.accent, fontSize:26 }}>
+          {user.name[0].toUpperCase()}
+        </div>
+        <div>
+          <div className="syne" style={{ fontSize:26, color:T.white }}>{user.name}</div>
+          <div style={{ fontSize:13, color:T.muted }}>{user.email} · {user.role==="creator"?"🎬 Creator":"👀 Viewer"}</div>
+        </div>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12, marginBottom:20 }}>
+        {[["Shows Watched","7"],["Votes Cast","23"],["Vote Credits", user.voteCredits||0]].map(([l,v]) => (
+          <div key={l} className="card" style={{ padding:16, textAlign:"center" }}>
+            <div className="syne" style={{ fontSize:30, color:T.white }}>{v}</div>
+            <div style={{ fontSize:12, color:T.muted }}>{l}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="card" style={{ padding:18, marginBottom:14 }}>
+        <div style={{ fontWeight:600, color:T.muted, fontSize:12, marginBottom:12, letterSpacing:"0.07em" }}>VOTE CREDITS</div>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div>
+            <div style={{ fontWeight:700, color:T.white, fontSize:20 }}>{user.voteCredits||0} votes remaining</div>
+            <div style={{ fontSize:13, color:T.muted, marginTop:2 }}>Used to vote for contestants in live shows</div>
+          </div>
+          <button className="btn-primary" onClick={onBuyVotes} style={{ padding:"10px 18px", fontSize:14, borderRadius:8 }}>
+            Buy More
+          </button>
+        </div>
+      </div>
+
+      <button className="btn-ghost" onClick={onLogout} style={{ padding:"10px 18px", fontSize:13 }}>Sign Out</button>
+    </div>
+  );
+}
+
+
+// ─── LEGAL PAGE ───────────────────────────────────────────────────────────────
+function LegalPage() {
+  const [tab, setTab] = useState("privacy");
+
+  const PRIVACY = [
+    { title:"What we collect", body:"Your name, email, role (Viewer or Creator), vote history, and payment transaction references. We never store card numbers — Paystack handles all card data securely." },
+    { title:"How we use it", body:"To create your account, process votes, show your name on the platform, and send account security emails. We never sell your data to advertisers." },
+    { title:"Who we share with", body:"Only our service providers: Google Firebase (database), Agora (live video), Paystack (payments), and Vercel (hosting). Each operates under their own privacy policy." },
+    { title:"Your rights", body:"You can access, correct, or delete your data at any time. Email support@realitylive.app and we respond within 30 days. You can also delete your account directly from your Profile page." },
+    { title:"Data security", body:"Your password is encrypted by Firebase and never visible to us. Firestore security rules ensure only you can access your own account data." },
+    { title:"Children", body:"RealityLive is strictly for users 18 and over. We do not knowingly collect data from anyone under 18. If you believe a minor has an account, email us immediately." },
+    { title:"Compliance", body:"This policy complies with Nigeria's NDPR 2019, the EU GDPR, and the CCPA where applicable." },
+    { title:"Contact", body:"privacy@realitylive.app — For data requests, deletions, or privacy concerns." },
+  ];
+
+  const TERMS = [
+    { title:"Eligibility", body:"You must be 18 or older to use RealityLive. By signing up you confirm this. We may terminate any account we believe belongs to a minor." },
+    { title:"Your account", body:"You are responsible for all activity under your account. Do not share your password. You may only have one account per person." },
+    { title:"What creators may NOT broadcast", body:"Nudity or sexual content · Violence or gore · Hate speech targeting race, religion, gender, or nationality · Harassment of individuals · Content involving minors · Illegal activities · Copyrighted content without permission." },
+    { title:"Voting and payments", body:"Vote credits have no cash value and cannot be refunded once used. Unused credits may be refunded within 24 hours of purchase. We cancel credits obtained through fraudulent payment." },
+    { title:"Content you broadcast", body:"You own your content. By broadcasting, you grant RealityLive a non-exclusive licence to display and store highlights for promotional use. You confirm you have the right to broadcast everything you stream." },
+    { title:"Our rights", body:"We may remove any content, suspend any account, or end any stream that violates these Terms — at any time, without prior notice." },
+    { title:"Limitation of liability", body:"RealityLive is provided as-is. We do not guarantee uninterrupted service or that all streams will be free of offensive content. We actively moderate but cannot catch everything in real time." },
+    { title:"Governing law", body:"These Terms are governed by the laws of the Federal Republic of Nigeria. Disputes are subject to Nigerian courts." },
+    { title:"Contact", body:"support@realitylive.app — For Terms questions, content reports, or account issues." },
+  ];
+
+  const items = tab === "privacy" ? PRIVACY : TERMS;
+
+  return (
+    <div>
+      <div className="syne" style={{ fontSize:26, color:T.white, marginBottom:4 }}>
+        LEGAL <span style={{ color:T.accent }}>DOCUMENTS</span>
+      </div>
+      <p style={{ color:T.muted, fontSize:14, marginBottom:20 }}>
+        These documents protect you and your users. Read them before launching publicly.
+      </p>
+
+      {/* Tab switcher */}
+      <div style={{ display:"flex", gap:8, marginBottom:24 }}>
+        {[["privacy","🔒 Privacy Policy"],["terms","📋 Terms of Service"]].map(([k,l]) => (
+          <button key={k} onClick={() => setTab(k)} style={{
+            padding:"9px 18px", borderRadius:8, fontFamily:"Space Grotesk", fontWeight:600, fontSize:13,
+            border:`1px solid ${tab===k ? T.accent : T.border}`,
+            background: tab===k ? T.accentLo : "transparent",
+            color: tab===k ? T.white : T.muted, cursor:"pointer"
+          }}>{l}</button>
+        ))}
+      </div>
+
+      {/* Warning banner */}
+      <div style={{ background:"rgba(245,166,35,0.08)", border:"1px solid rgba(245,166,35,0.3)", borderRadius:10, padding:"12px 16px", marginBottom:20, fontSize:13, color:"#F5A623" }}>
+        ⚠️ <strong>Before going public:</strong> Add links to these pages in your signup form footer and in your app's main menu. This is legally required.
+      </div>
+
+      <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+        {items.map((item, i) => (
+          <div key={i} className="card" style={{ padding:"16px 18px" }}>
+            <div style={{ fontWeight:700, color:T.white, marginBottom:6, fontSize:14 }}>{item.title}</div>
+            <div style={{ fontSize:13, color:T.muted, lineHeight:1.7 }}>{item.body}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="card" style={{ padding:18, marginTop:16, borderColor:T.accent+"44" }}>
+        <div style={{ fontWeight:700, color:T.white, marginBottom:8 }}>📧 Platform contact details</div>
+        <div style={{ fontSize:13, color:T.muted, lineHeight:2 }}>
+          General support: <strong style={{ color:T.text }}>support@realitylive.app</strong><br/>
+          Privacy requests: <strong style={{ color:T.text }}>privacy@realitylive.app</strong><br/>
+          Urgent content reports: <strong style={{ color:T.text }}>support@realitylive.app</strong> (reviewed within 24hrs)
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── ROOT APP ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [tab, setTab] = useState("shows");
+  const [showGoLive, setShowGoLive] = useState(false);
+  const [activeShow, setActiveShow] = useState(null);
+  const [showBuyVotes, setShowBuyVotes] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [search, setSearch] = useState("");
+
+  const notify = msg => setToast(msg);
+  const filtered = SHOWS.filter(s => s.title.toLowerCase().includes(search.toLowerCase()));
+
+  function handleVotePurchase(credits, label) {
+    if (!user) return;
+    setUser(p => ({ ...p, voteCredits:(p.voteCredits||0)+credits }));
+    notify(`${label} unlocked! +${credits} votes added.`);
+    // Persist vote credits to Firestore
+    if (user.uid) fbAddVotes(user.uid, credits).catch(console.error);
+  }
+
+  return (
+    <>
+      <style>{CSS}</style>
+
+      {!user && <AuthModal onAuth={u => setUser({ ...u, voteCredits:3 })} />}
+      {showGoLive && user && <GoLiveModal user={user} onClose={() => setShowGoLive(false)} onToast={notify} />}
+      {activeShow && user && (
+        <ShowDetail show={activeShow} user={user}
+          onClose={() => setActiveShow(null)}
+          onToast={notify}
+          onBuyVotes={() => { setActiveShow(null); setShowBuyVotes(true); }} />
+      )}
+      {showBuyVotes && user && (
+        <BuyVotesModal user={user}
+          onClose={() => setShowBuyVotes(false)}
+          onSuccess={handleVotePurchase} />
+      )}
+      {toast && <Toast msg={toast} onDone={() => setToast(null)} />}
+
+      <div style={{ minHeight:"100vh", display:"flex", flexDirection:"column" }}>
+
+        {/* Broadcast ticker */}
+        <div style={{ background:T.accent, padding:"6px 0", overflow:"hidden" }}>
+          <div className="ticker-inner" style={{ fontSize:12, fontWeight:700, color:"#000", letterSpacing:"0.06em" }}>
+            🔴 LIVE NOW: Vocal Powerhouse · Street Comedy Battle · Dance Explosion · Hustle Nation &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+            🔴 LIVE NOW: Vocal Powerhouse · Street Comedy Battle · Dance Explosion · Hustle Nation &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+          </div>
+        </div>
+
+        {/* Nav */}
+        <nav style={{ background:T.surface, borderBottom:`1px solid ${T.border}`,
+          padding:"0 22px", display:"flex", alignItems:"center", gap:12, height:56,
+          position:"sticky", top:0, zIndex:50 }}>
+          <div className="syne" style={{ fontSize:22, color:T.white, marginRight:8 }}>
+            REALITY<span style={{ color:T.accent }}>LIVE</span>
+          </div>
+          <div style={{ display:"flex", gap:2 }}>
+            {[["shows","📺 Shows"],["leaderboard","🏆 Top Talents"],["setup","🚀 Setup"],["legal","📄 Legal"],["profile","👤 Profile"]].map(([k,l]) => (
+              <button key={k} className={`ntab ${tab===k?"on":""}`} onClick={() => setTab(k)}>{l}</button>
+            ))}
+          </div>
+          <div style={{ flex:1 }} />
+          <input placeholder="Search shows..." value={search}
+            onChange={e => { setSearch(e.target.value); setTab("shows"); }}
+            style={{ width:170, padding:"7px 12px", fontSize:13 }} className="hide-sm" />
+
+          {user?.voteCredits > 0 && (
+            <div style={{ fontSize:12, color:T.accent, fontWeight:700, background:T.accentLo,
+              border:`1px solid ${T.accent}44`, borderRadius:7, padding:"5px 10px" }}>
+              🗳️ {user.voteCredits} votes
+            </div>
+          )}
+
+          {user?.role==="creator" && (
+            <button className="btn-danger" onClick={() => setShowGoLive(true)}
+              style={{ padding:"8px 16px", fontSize:13, borderRadius:8, display:"flex", alignItems:"center", gap:6 }}>
+              <span className="live-dot" style={{ width:6, height:6 }} />
+              Go Live
+            </button>
+          )}
+          {user && (
+            <div className="avatar" style={{ width:32, height:32, background:T.accent+"33", color:T.accent,
+              cursor:"pointer", fontSize:13 }} onClick={() => setTab("profile")}>
+              {user.name[0].toUpperCase()}
+            </div>
+          )}
+        </nav>
+
+        {/* Hero */}
+        {tab==="shows" && (
+          <div style={{ background:`linear-gradient(135deg,${T.surface},${T.bg})`,
+            borderBottom:`1px solid ${T.border}`, padding:"22px 24px",
+            display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+            <div>
+              <div className="syne" style={{ fontSize:32, color:T.white, lineHeight:1 }}>
+                {fmt(SHOWS.reduce((a,s)=>a+s.viewers,0))}
+                <span style={{ color:T.accent }}> PEOPLE WATCHING</span>
+              </div>
+              <p style={{ color:T.muted, fontSize:14, marginTop:4 }}>
+                {SHOWS.length} talent shows live right now · Fan voting open
+              </p>
+            </div>
+            <div style={{ display:"flex", gap:20 }} className="hide-sm">
+              {[["🎤","Talent","Shows"],["🗳️","24K+","Votes Today"],["🏆","5","Weekly Winners"]].map(([e,v,l]) => (
+                <div key={l} style={{ textAlign:"center" }}>
+                  <div style={{ fontSize:18 }}>{e}</div>
+                  <div className="syne" style={{ fontSize:20, color:T.white }}>{v}</div>
+                  <div style={{ fontSize:11, color:T.muted }}>{l}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Main */}
+        <main style={{ flex:1, padding:24, maxWidth:1060, width:"100%", margin:"0 auto" }}>
+          {tab==="shows" && (
+            <>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+                <div className="syne" style={{ fontSize:20, color:T.white }}>
+                  {search ? `"${search}"` : "LIVE NOW"}
+                </div>
+                <button onClick={() => setShowBuyVotes(true)}
+                  style={{ fontSize:13, color:T.accent, background:T.accentLo,
+                    border:`1px solid ${T.accent}44`, borderRadius:8,
+                    padding:"8px 14px", cursor:"pointer", fontFamily:"Space Grotesk", fontWeight:700 }}>
+                  🗳️ Buy Votes
+                </button>
+              </div>
+              {filtered.length===0
+                ? <div style={{ textAlign:"center", padding:"60px 0", color:T.muted }}>
+                    <div style={{ fontSize:36, marginBottom:12 }}>📭</div>
+                    <p>No shows match "{search}"</p>
+                  </div>
+                : <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(250px,1fr))", gap:16 }}>
+                    {filtered.map(s => <ShowCard key={s.id} show={s} onClick={() => setActiveShow(s)} />)}
+                  </div>
+              }
+            </>
+          )}
+          {tab==="leaderboard" && <Leaderboard />}
+          {tab==="setup"       && <SetupGuide />}
+          {tab==="legal"       && <LegalPage />}
+          {tab==="profile" && user && (
+            <Profile user={user}
+              onLogout={() => { setUser(null); setTab("shows"); }}
+              onBuyVotes={() => setShowBuyVotes(true)} />
+          )}
+        </main>
+
+        <footer style={{ borderTop:`1px solid ${T.border}`, padding:"14px 24px",
+          display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div className="syne" style={{ fontSize:15, color:T.muted }}>
+            REALITY<span style={{ color:T.accent }}>LIVE</span>
+          </div>
+          <p style={{ fontSize:12, color:T.muted }}>
+            Agora Live · Paystack Payments · React · Deploy on Vercel
+          </p>
+        </footer>
+      </div>
+    </>
+  );
+}
